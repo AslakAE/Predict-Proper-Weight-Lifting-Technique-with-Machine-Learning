@@ -1,0 +1,295 @@
+---
+title: "Predict Proper Weight Lifting Technique with Machine Learning"
+author: "Aslak Eriksen"
+date: "26 7 2019"
+output: html_document
+---
+
+# Executive Summary
+
+The report shows that a random forest model applied on data from accelerometers may predict if a dumbbell biceps curl is performed correctly. The random forest model was preferred to other methods, such as linear discriminant analysis (lda), boosting (gbm) and model stacking (random forest). The training data from Velloso, et al. (2013) was divided into both training and validation data - to aid the choice of prediction model without involving the test data set. With the use of the validation data, the expected out of sample error is approximately 0,6%.
+
+# About the Analysis
+
+The purpose of this report is to predict in what manner a weight lifting exercise is performed. The prediction is based on data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants.
+
+The data stems from the paper *Qualitative Activity Recognition of Weight Lifting Exercises* (Velloso, et al., 2013).
+
+> "Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions (..).
+> Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes."
+>
+> `r tufte::quote_footer('-- Velloso, et al.')`
+
+
+# Initation: Preparing the Data
+
+## Load and Read Data
+The following code shows how the data is downloaded into R.
+```{r, cache = TRUE, message = FALSE, results = "hide"}
+# Load packages
+library(dplyr)
+library(tidyverse)
+library(reshape2)
+library(tidyr)
+library(caret)
+library(AppliedPredictiveModeling)
+library(parallel)
+library(doParallel)
+library(scales)
+library(plotROC)
+
+# Create folder 'data' if not already existing
+if(!file.exists("./data")) {
+  dir.create("./data")
+}
+
+# Download .csv train and test files if not already existing in 'data'
+buildDataFile <- './data/pml-training.csv'
+       if(!file.exists(buildDataFile))
+        {
+               trainFileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+                download.file(trainFileUrl, destfile = "./data/pml-training.csv", method = "curl")   
+       }
+
+testFile <- './data/pml-testing.csv'
+       if(!file.exists(testFile))
+        {
+               testFileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+                download.file(testFileUrl, destfile = "./data/pml-testing.csv", method = "curl")   
+       }
+```
+
+The following code shows how the data is loaded into R and read into data frames.
+```{r, cache = TRUE, results = "hide", message = FALSE}
+# Create data frames from read.csv
+buildData <- read.csv("./data/pml-training.csv",
+               header = TRUE,
+               quote = "\"'",
+               strip.white = TRUE,
+               stringsAsFactors = F,
+               sep = ",")
+
+testing <- read.csv("./data/pml-testing.csv",
+               header = TRUE,
+               quote = "\"'",
+               strip.white = TRUE,
+               stringsAsFactors = F,
+               sep = ",")
+
+```
+
+## Method for Cross Validation: Traning and Validation Data Set
+The training data is divided into training and validation data (75% and 25%). There are many observations in the data set. It is common to only approximate the validation step - analytically or by sample re-use - when data is scarce. Consequently, we will seperate the data into both training and validation, and find a accurate prediction model without the use of the test data. The test data is reserved for evaluation of the final prediction model.
+
+It might be argued that a validation set is not necessary when building a random forest model. The random forest model prevents overfitting by constructing each tree with a different bootstrap sample from training data. However, other methods require a validation set and the seperation is considered "good practice" within data science.
+
+```{r, cache = TRUE, message = FALSE, results = "hide", fig.height = 3}
+# Divide 75 % training, 25 % cross validation
+inBuildData = createDataPartition(buildData$classe, p = 3/4)[[1]]
+training = as.data.frame(buildData[ inBuildData,])
+validation = as.data.frame(buildData[-inBuildData,])
+
+# Create dataframe with 3 values, training validation and test. New column with the count of observations.
+datasetType <- c("training", "validation", "testing")
+datasetObservations <- c(nrow(training), nrow(validation), nrow(testing))
+observationsDF <- data.frame("Dataset" = datasetType, "Observations" = datasetObservations, stringsAsFactors = FALSE)
+        
+# Create horizontal bar chart with the proportions of observations witin the datasets. Color different.
+ggplot(data = observationsDF, aes(x = Dataset, y = Observations)) + geom_bar(stat="identity") + coord_flip()
+```
+
+## Clean the Data: Only Keep the Relevant Predictors
+
+Not all the columns in the data set are useful as predictors. It is advantageous for the prediction model if we can limit the number of predictors. This will improve the performance of the prediction model.
+
+
+- Remove descriptive columns (e.g. name and timestamp) that are not relevant for a prediction model.
+```{r, cache = TRUE, results = "hide", fig.show = "hide", message = FALSE}
+## TRAINING DATA
+training <- training %>% select(-X, -user_name, -raw_timestamp_part_1, -raw_timestamp_part_2, -cvtd_timestamp, -num_window)
+
+## VALIDATION DATA
+validation <- validation %>% select(-X, -user_name, -raw_timestamp_part_1, -raw_timestamp_part_2, -cvtd_timestamp, -num_window)
+
+## TEST DATA
+testing <- testing %>% select(-X, -user_name, -raw_timestamp_part_1, -raw_timestamp_part_2, -cvtd_timestamp, -num_window)
+```
+
+
+- Remove summary statistics. According to Vellose, et al. (2013), eight features - mean, variance, standard deviation, max, min, amplitude, kurtosis and skewness - are calculated from the four sensors. Hence, they are derived values. Additionally, these variables have a high percentage of missing values.
+```{r, cache = TRUE, results = "hide", fig.show = "hide", message = FALSE}
+## TRAINING DATA
+training <- training %>%
+        select(-starts_with("avg_")) %>%
+        select(-starts_with("var_")) %>%
+        select(-starts_with("stddev_")) %>%
+        select(-starts_with("max_")) %>%
+        select(-starts_with("min_")) %>%
+        select(-starts_with("amplitude_")) %>%
+        select(-starts_with("kurtosis_")) %>%
+        select(-starts_with("skewness"))
+
+## VALIDATION DATA
+validation <- validation %>%
+        select(-starts_with("avg_")) %>%
+        select(-starts_with("var_")) %>%
+        select(-starts_with("stddev_")) %>%
+        select(-starts_with("max_")) %>%
+        select(-starts_with("min_")) %>%
+        select(-starts_with("amplitude_")) %>%
+        select(-starts_with("kurtosis_")) %>%
+        select(-starts_with("skewness"))
+
+## TEST DATA
+testing <- testing %>%
+        select(-starts_with("avg_")) %>%
+        select(-starts_with("var_")) %>%
+        select(-starts_with("stddev_")) %>%
+        select(-starts_with("max_")) %>%
+        select(-starts_with("min_")) %>%
+        select(-starts_with("amplitude_")) %>%
+        select(-starts_with("kurtosis_")) %>%
+        select(-starts_with("skewness"))
+```
+
+
+- Remove near zero variance predictors. These predictors will not be useful for the model.
+```{r, cache = TRUE, results = "hide", fig.show = "hide", message = FALSE}
+## TRAINING DATA
+nzv_cols <- nearZeroVar(training)
+if(length(nzv_cols) > 0) training <- training[, -nzv_cols]
+
+## VALIDATION DATA
+validation <- validation[, -nzv_cols]
+
+## TEST DATA
+testing <- testing[, -nzv_cols]
+```
+
+# Prediction Model
+
+## Final Prediction Model: Random Forest
+
+A random forest model - without any model stacking (combination of classifiers) - is chosen as the final prediction model. The section below describes how the model was determined through application of the training and validation data set.
+
+## Which Prediction Models to Assess?
+
+Our starting point is that combining predictors - ensembling - could give a accurate model. However, the increased accuracy in a complex ensemble also implies a loss of interpretability. 
+
+We will attempt to combine the following classifiers:
+- Random forest 
+- Boosted predictor (Generalizer Boosted Regression Modeling method)
+- Linear discriminant analysis (LDA)
+
+The method for the combined classifier is random forest.
+
+The final prediction model is determined based on which classifier that has the best performance.
+
+## Train and Determine Model
+
+Train the models.
+
+```{r, cache = TRUE, message = FALSE, results = "hide"}
+# Seed for modelling - to ensure reproducibility.
+set.seed(1337)
+
+# Ensuring that parallel processing is used on computer. This is required for computing random forest and generalized boosted regression model. Otherwise, the computation will be very slow.
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+fitControl <- trainControl(method = "cv",
+                           number = 5,
+                           allowParallel = TRUE)
+
+# Random forest
+set.seed(1337)
+## Train model
+rf.modelFit <- train(classe ~ ., method = "rf", data = training, trControl = fitControl)
+## Check model on the validation set
+pred1 <- predict(rf.modelFit, validation)
+## Results
+cm_pred1 <- confusionMatrix(table(pred1, validation$classe))
+print(rf.modelFit$finalModel)
+
+# Boosted predictor with Generalized Boosted Regression Modeling (gbm) method
+set.seed(1337)
+## Train model
+gbm.modelFit <- train(classe ~ ., method = "gbm", data = training, trControl = fitControl)
+## Check model on the validation set
+pred2 <- predict(gbm.modelFit, validation)
+## Results
+cm_pred2 <- confusionMatrix(table(pred2, validation$classe))
+
+# Linear discriminant analysis (lda)
+set.seed(1337)
+## Train model
+lda.modelFit <- train(classe ~ ., method = "lda", data = training)
+## Check model on the validation set
+pred3 <- predict(lda.modelFit, validation)
+## Results
+cm_pred3 <- confusionMatrix(table(pred3, validation$classe))
+
+# STACKED with random forest
+set.seed(1337)
+predDF <- data.frame(pred1, pred2, pred3, classe = validation$classe)
+## Train model
+combModFit <- train(classe ~ ., method = "rf", data = predDF, trControl = fitControl)
+## Check model on the validation set
+combPred <- predict(combModFit, predDF)
+## Results
+cm_combPred <- confusionMatrix(combPred, as.factor(validation$classe))
+
+# Revert back to single threaded processing in R
+stopCluster(cluster)
+registerDoSEQ()
+```
+Retrieve the accuracy from the different models. 
+```{r, cache = TRUE, message = FALSE, results = "hide", fig.height = 3}
+# Data frame of accuracy from models
+accuracy_pred1 <- cm_pred1$overall["Accuracy"]
+accuracy_pred2 <- cm_pred2$overall["Accuracy"]
+accuracy_pred3 <- cm_pred3$overall["Accuracy"]
+accuracy_combPred <- cm_combPred$overall["Accuracy"]
+
+x <- c("rf", "gbm", "lda", "combined rf")
+y <- c(accuracy_pred1, accuracy_pred2, accuracy_pred3, accuracy_combPred)
+y <- percent(y)
+accuracy_df <- data.frame("Classifier" = x, "Accuracy" = y, stringsAsFactors = FALSE)
+accuracy_df
+
+# Plot of accuracy in classifiers
+plot <- ggplot(data = accuracy_df, aes(x = Classifier, y = Accuracy)) 
+plot <- plot + geom_bar(stat="identity")
+plot <- plot + geom_text(aes(x= Classifier, y = Accuracy, label = Accuracy), vjust = 3, size = 5, colour = "white")
+plot
+```
+
+
+As shown above, the accuracy of the **random forest model** is approximately equal to the combined random forest prediction model. We choose the random forest model. It is much simpler than the combined model and has more or less the same performance.
+
+# Expected Out of Sample Error
+
+We apply the in sample error to estimate the out of sample error. We expect the out of sample error to be greater on the new data set (test data set).
+
+```{r, cache = TRUE, message = FALSE}
+# Table of predicted values for validation set
+table(pred2, validation$classe)
+
+error_pred1 <- percent(1-accuracy_pred1)
+accuracy_pred1 <- percent(accuracy_pred1)
+```
+
+The table above shows the performance of the prediction model on the validation data set. As seen earlier, the accuracy on the validation set is `r accuracy_pred1`. Hence, the expected out of sample error is **`r error_pred1`**.
+
+# Prediction for Test Data Set
+
+The test data set does not answer in what manner the exercise was performed. That information is given in the quiz portion of the course project. The predicted class of the weight lifting exercise for the test data is shown below.
+
+```{r, cache = TRUE, message = FALSE}
+# Table of predicted values for test data
+predict(rf.modelFit, testing)
+```
+
+
+# References
+
+- Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
